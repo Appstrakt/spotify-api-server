@@ -3,6 +3,7 @@
 #include <libspotify/api.h>
 #include <string.h>
 #include <stdbool.h>
+#include <syslog.h>
 
 #include "constants.h"
 
@@ -90,39 +91,46 @@ json_t *playlist_to_json(sp_playlist *playlist, json_t *object) {
 
   for (int i = 0; i < sp_playlist_num_tracks(playlist); i++) {
     json_t *track_object = json_object();
-    json_t *album_object = json_object();
-    json_t *artist_object = json_object();
+    sp_track *track      = sp_playlist_track(playlist, i);
+    sp_link *track_link  = sp_link_create_from_track(track, 0); // TODO: these can be multiples
+    sp_album *album      = sp_track_album(track);
+    sp_artist *artist    = sp_track_artist(track, 0); // TODO: these can be multiples
     
-    sp_track *track = sp_playlist_track(playlist, i);
-    sp_link *track_link = sp_link_create_from_track(track, 0); // TODO: these can be multiples
-    
-    sp_album *album = sp_track_album(track);
-    sp_link *album_link = sp_link_create_from_album(album);
+    if (album != NULL)
+    {
+      json_t *album_object = json_object();
+      sp_link *album_link = sp_link_create_from_album(album);
+      sp_link_as_string(album_link, album_uri, kAlbumLinkLength);
 
-    sp_artist *artist = sp_track_artist(track, 0); // TODO: these can be multiples
-    sp_link *artist_link = sp_link_create_from_artist(artist);
+      json_object_set_new(album_object, "name", json_string_nocheck(sp_album_name(album)));
+      json_object_set_new(album_object, "uri", json_string_nocheck(album_uri));
+      json_object_set_new(track_object, "album", album_object);
+
+      sp_link_release(album_link);
+    }
+
+    if (artist != NULL)
+    {
+      json_t *artist_object = json_object();
+      sp_link *artist_link = sp_link_create_from_artist(artist);
+      sp_link_as_string(artist_link, artist_uri, kArtistLinkLength);
+
+      json_object_set_new(artist_object, "name", json_string_nocheck(sp_artist_name(artist)));
+      json_object_set_new(artist_object, "uri", json_string_nocheck(artist_uri));
+      json_object_set_new(track_object, "artist", artist_object);
+
+      sp_link_release(artist_link);
+    }
 
     sp_link_as_string(track_link, track_uri, kTrackLinkLength);
-    sp_link_as_string(album_link, album_uri, kTrackLinkLength);
-    sp_link_as_string(artist_link, artist_uri, kTrackLinkLength);
 
     json_object_set_new(track_object, "name", json_string_nocheck(sp_track_name(track)));
     json_object_set_new(track_object, "duration", json_integer(sp_track_duration(track)));
     json_object_set_new(track_object, "uri", json_string_nocheck(track_uri));
 
-    json_object_set_new(album_object, "name", json_string_nocheck(sp_album_name(album)));
-    json_object_set_new(album_object, "uri", json_string_nocheck(album_uri));
-    json_object_set_new(track_object, "album", album_object);
-
-    json_object_set_new(artist_object, "name", json_string_nocheck(sp_artist_name(artist)));
-    json_object_set_new(artist_object, "uri", json_string_nocheck(artist_uri));
-    json_object_set_new(track_object, "artist", artist_object);
-
     json_array_append_new(tracks, track_object);
 
     sp_link_release(track_link);
-    sp_link_release(album_link);
-    sp_link_release(artist_link);
   }
 
   return object;
