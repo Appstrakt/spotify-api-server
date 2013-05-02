@@ -148,8 +148,9 @@ static struct playlistcontainer_handler *register_playlistcontainer_callbacks(
   handler->callback = callback;
   handler->playlistcontainer_callbacks = playlistcontainer_callbacks;
   handler->userdata = userdata;
-  sp_playlistcontainer_add_callbacks(pc, handler->playlistcontainer_callbacks,
+  sp_error error = sp_playlistcontainer_add_callbacks(pc, handler->playlistcontainer_callbacks,
                                      handler);
+  syslog(LOG_DEBUG, "playlistcontainer_add_callbacks: %d", error);
   return handler;
 }
 
@@ -158,6 +159,7 @@ static void playlistcontainer_dispatch(sp_playlistcontainer *pc, void *userdata)
   sp_playlistcontainer_remove_callbacks(pc,
                                         handler->playlistcontainer_callbacks,
                                         handler);
+  handler->playlistcontainer_callbacks = NULL;
   handler->callback(pc, handler->request, handler->userdata);
   free(handler);
 }
@@ -200,6 +202,7 @@ static sp_playlistcontainer_callbacks playlistcontainer_loaded_callbacks = {
 static void not_implemented(sp_playlist *playlist,
                             struct evhttp_request *request,
                             void *userdata) {
+  sp_playlist_release(playlist);
   evhttp_send_error(request, HTTP_NOTIMPL, "Not Implemented");
 }
 
@@ -215,6 +218,7 @@ static void get_playlist(sp_playlist *playlist,
     return;
   }
 
+  sp_playlist_release(playlist);
   send_reply_json(request, HTTP_OK, "OK", json);
 }
 
@@ -224,6 +228,7 @@ static void get_playlist_collaborative(sp_playlist *playlist,
   assert(sp_playlist_is_loaded(playlist));
   json_t *json = json_object();
   playlist_to_json_set_collaborative(playlist, json);
+  sp_playlist_release(playlist);
   send_reply_json(request, HTTP_OK, "OK", json);
 }
 
@@ -240,6 +245,7 @@ static void get_playlist_subscribers_callback(sp_playlist *playlist,
   }
 
   sp_playlist_subscribers_free(subscribers);
+  sp_playlist_release(playlist);
   send_reply_json(request, HTTP_OK, "OK", array);
 }
 
@@ -312,6 +318,9 @@ static void get_user_playlists(sp_playlistcontainer *pc,
   int status = HTTP_OK;
 
   for (int i = 0; i < sp_playlistcontainer_num_playlists(pc); i++) {
+    if (sp_playlistcontainer_playlist_type(pc, i) != SP_PLAYLIST_TYPE_PLAYLIST)
+      continue;
+
     sp_playlist *playlist = sp_playlistcontainer_playlist(pc, i);
 
     if (!sp_playlist_is_loaded(playlist)) {
@@ -324,6 +333,7 @@ static void get_user_playlists(sp_playlistcontainer *pc,
     json_array_append_new(playlists, playlist_json);
   }
 
+  sp_playlistcontainer_release(pc);
   send_reply_json(request, status, status == HTTP_OK ? "OK" : "Partial Content",
                   json);
 }
@@ -440,6 +450,38 @@ static void put_playlist(sp_playlist *playlist,
   }
 }
 
+static void delete_playlist(sp_playlist *playlist,
+                            struct evhttp_request *request,
+                            void *userdata) {
+  if (playlist == NULL) {
+    send_error(request, HTTP_ERROR, "Unable to delete playlist");
+    return;
+  }
+
+  struct state *state = userdata;
+  sp_session *session = state->session;
+  sp_playlistcontainer *pc = sp_session_playlistcontainer(session);
+
+  for (int i = 0; i < sp_playlistcontainer_num_playlists(pc); i++) {
+    if (sp_playlistcontainer_playlist_type(pc, i) != SP_PLAYLIST_TYPE_PLAYLIST)
+      continue;
+
+    if (sp_playlistcontainer_playlist(pc, i) != playlist) {
+      sp_error remove_error = sp_playlistcontainer_remove_playlist(pc, i);
+
+      if (remove_error == SP_ERROR_OK) {
+        send_reply(request, HTTP_OK, "OK", NULL);
+      } else {
+        send_error_sp(request, HTTP_BADREQUEST, remove_error);
+      }
+
+      return;
+    }
+  }
+
+  send_error(request, HTTP_BADREQUEST, "Unable to delete playlist");
+}
+
 static void put_playlist_add_tracks(sp_playlist *playlist,
                                     struct evhttp_request *request,
                                     void *userdata) {
@@ -453,9 +495,7 @@ static void put_playlist_add_tracks(sp_playlist *playlist,
   int index;
 
   if (index_field == NULL || sscanf(index_field, "%d", &index) <= 0) {
-    send_error(request, HTTP_BADREQUEST,
-               "Bad parameter: index must be numeric");
-    return;
+    index = sp_playlist_num_tracks(playlist);
   }
 
   // Parse JSON
@@ -463,12 +503,14 @@ static void put_playlist_add_tracks(sp_playlist *playlist,
   json_t *json = read_request_body_json(request, &loads_error);
 
   if (json == NULL) {
+    sp_playlist_release(playlist);
     send_error(request, HTTP_BADREQUEST,
                loads_error.text ? loads_error.text : "Unable to parse JSON");
     return;
   }
 
   if (!json_is_array(json)) {
+    sp_playlist_release(playlist);
     json_decref(json);
     send_error(request, HTTP_BADREQUEST, "Not valid JSON array");
     return;
@@ -478,6 +520,7 @@ static void put_playlist_add_tracks(sp_playlist *playlist,
   int num_tracks = json_array_size(json);
 
   if (num_tracks == 0) {
+    sp_playlist_release(playlist);
     send_reply(request, HTTP_OK, "OK", NULL);
     return;
   }
@@ -503,6 +546,7 @@ static void put_playlist_add_tracks(sp_playlist *playlist,
   if (add_tracks_error != SP_ERROR_OK) {
     sp_playlist_remove_callbacks(playlist, handler->playlist_callbacks,
                                  handler);
+    sp_playlist_release(playlist);
     free(handler);
     send_error_sp(request, HTTP_BADREQUEST, add_tracks_error);
   }
@@ -525,6 +569,7 @@ static void put_playlist_remove_tracks(sp_playlist *playlist,
   if (index_field == NULL ||
       sscanf(index_field, "%d", &index) <= 0 ||
       index < 0) {
+    sp_playlist_release(playlist);
     send_error(request, HTTP_BADREQUEST,
                "Bad parameter: index must be numeric");
     return;
@@ -536,6 +581,7 @@ static void put_playlist_remove_tracks(sp_playlist *playlist,
   if (count_field == NULL ||
       sscanf(count_field, "%d", &count) <= 0 ||
       count < 1) {
+    sp_playlist_release(playlist);
     send_error(request, HTTP_BADREQUEST,
                "Bad parameter: count must be numeric and positive");
     return;
@@ -549,11 +595,12 @@ static void put_playlist_remove_tracks(sp_playlist *playlist,
   struct playlist_handler *handler = register_playlist_callbacks(
       playlist, request, &get_playlist,
       &playlist_update_in_progress_callbacks, NULL);
-  sp_error remove_tracks_error = sp_playlist_remove_tracks(playlist, tracks, 
+  sp_error remove_tracks_error = sp_playlist_remove_tracks(playlist, tracks,
                                                            count);
 
   if (remove_tracks_error != SP_ERROR_OK) {
     sp_playlist_remove_callbacks(playlist, handler->playlist_callbacks, handler);
+    sp_playlist_release(playlist);
     free(handler);
     send_error_sp(request, HTTP_BADREQUEST, remove_tracks_error);
   }
@@ -569,6 +616,7 @@ static void put_playlist_patch(sp_playlist *playlist,
   size_t buflen = evbuffer_get_length(buf);
 
   if (buflen == 0) {
+    sp_playlist_release(playlist);
     send_error(request, HTTP_BADREQUEST, "No body");
     return;
   }
@@ -578,12 +626,14 @@ static void put_playlist_patch(sp_playlist *playlist,
   json_t *json = read_request_body_json(request, &loads_error);
 
   if (json == NULL) {
+    sp_playlist_release(playlist);
     send_error(request, HTTP_BADREQUEST,
                loads_error.text ? loads_error.text : "Unable to parse JSON");
     return;
   }
 
   if (!json_is_array(json)) {
+    sp_playlist_release(playlist);
     json_decref(json);
     send_error(request, HTTP_BADREQUEST, "Not valid JSON array");
     return;
@@ -593,6 +643,7 @@ static void put_playlist_patch(sp_playlist *playlist,
   int num_tracks = json_array_size(json);
 
   if (num_tracks == 0) {
+    sp_playlist_release(playlist);
     send_reply(request, HTTP_OK, "OK", NULL);
     return;
   }
@@ -632,6 +683,7 @@ static void put_playlist_patch(sp_playlist *playlist,
 
   // Bail if no tracks could be read from input
   if (num_valid_tracks == 0) {
+    sp_playlist_release(playlist);
     send_error(request, HTTP_BADREQUEST, "No valid tracks");
     free(tracks);
     return;
@@ -642,10 +694,11 @@ static void put_playlist_patch(sp_playlist *playlist,
   // Apply diff
   apr_pool_t *pool = state->pool;
   svn_diff_t *diff;
-  svn_error_t *diff_error = diff_playlist_tracks(&diff, playlist, tracks, 
-                                                 num_valid_tracks, pool); 
+  svn_error_t *diff_error = diff_playlist_tracks(&diff, playlist, tracks,
+                                                 num_valid_tracks, pool);
 
   if (diff_error != SVN_NO_ERROR) {
+    sp_playlist_release(playlist);
     free(tracks);
     svn_handle_error2(diff_error, stderr, false, "Diff");
     send_error(request, HTTP_BADREQUEST, "Search failed");
@@ -657,6 +710,7 @@ static void put_playlist_patch(sp_playlist *playlist,
                                                         state->session);
 
   if (apply_error != SVN_NO_ERROR) {
+    sp_playlist_release(playlist);
     free(tracks);
     svn_handle_error2(apply_error, stderr, false, "Updating playlist");
     send_error(request, HTTP_BADREQUEST, "Could not apply diff");
@@ -699,6 +753,8 @@ static void handle_user_request(struct evhttp_request *request,
               &playlistcontainer_loaded_callbacks,
               session);
         }
+
+        return;
       } else if (strncmp(action, "starred", 7) == 0) {
         sp_playlist *playlist = sp_session_starred_for_user_create(session,
             canonical_username);
@@ -710,6 +766,8 @@ static void handle_user_request(struct evhttp_request *request,
               &playlist_state_changed_callbacks,
               session);
         }
+
+        return;
       }
       break;
 
@@ -717,13 +775,12 @@ static void handle_user_request(struct evhttp_request *request,
     case EVHTTP_REQ_POST:
       if (strncmp(action, "inbox", 5) == 0) {
         put_user_inbox(canonical_username, request, session);
+        return;
       }
       break;
-
-    default:
-      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
-      break;
   }
+
+  evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
 }
 
 // Request dispatcher
@@ -740,6 +797,7 @@ static void handle_request(struct evhttp_request *request,
     case EVHTTP_REQ_GET:
     case EVHTTP_REQ_PUT:
     case EVHTTP_REQ_POST:
+    case EVHTTP_REQ_DELETE:
       break;
 
     default:
@@ -788,7 +846,6 @@ static void handle_request(struct evhttp_request *request,
     switch (http_method) {
       case EVHTTP_REQ_PUT:
       case EVHTTP_REQ_POST:
-        // TODO(liesen): Add code to create playlists
         put_playlist(NULL, request, session);
         break;
 
@@ -825,11 +882,8 @@ static void handle_request(struct evhttp_request *request,
     return;
   }
 
-  sp_playlist_add_ref(playlist);
-
   // Dispatch request
   char *action = strtok(NULL, "/");
-  free(uri);
 
   // Default request handler
   handle_playlist_fn request_callback = &not_implemented;
@@ -862,6 +916,13 @@ static void handle_request(struct evhttp_request *request,
       }
     }
     break;
+
+  case EVHTTP_REQ_DELETE:
+    {
+      callback_userdata = state;
+      request_callback = &delete_playlist;
+    }
+    break;
   }
 
   if (sp_playlist_is_loaded(playlist)) {
@@ -872,38 +933,8 @@ static void handle_request(struct evhttp_request *request,
                                 &playlist_state_changed_callbacks,
                                 callback_userdata);
   }
-}
 
-static void playlistcontainer_loaded(sp_playlistcontainer *pc, void *userdata);
-
-static sp_playlistcontainer_callbacks playlistcontainer_callbacks = {
-  .container_loaded = playlistcontainer_loaded
-};
-
-static void playlistcontainer_loaded(sp_playlistcontainer *pc, void *userdata) {
-  syslog(LOG_DEBUG, "playlistcontainer_loaded\n");
-  sp_session *session = userdata;
-  struct state *state = sp_session_userdata(session);
-
-  sp_playlistcontainer_remove_callbacks(pc, &playlistcontainer_callbacks, session);
-
-  state->http = evhttp_new(state->event_base);
-  evhttp_set_timeout(state->http, 60);
-  evhttp_set_gencb(state->http, &handle_request, state);
-
-  // Bind HTTP server
-  int bind = evhttp_bind_socket(state->http, state->http_host,
-                                state->http_port);
-
-  if (bind == -1) {
-    syslog(LOG_WARNING, "Could not bind HTTP server socket to %s:%d",
-           state->http_host, state->http_port);
-    sp_session_logout(session);
-    return;
-  }
-
-  syslog(LOG_DEBUG, "HTTP server listening on %s:%d", state->http_host,
-         state->http_port);
+  free(uri);
 }
 
 void credentials_blob_updated(sp_session *session, const char *blob) {
@@ -960,10 +991,22 @@ void logged_in(sp_session *session, sp_error error) {
 
   state->session = session;
   evsignal_add(state->sigint, NULL);
+  state->http = evhttp_new(state->event_base);
+  evhttp_set_gencb(state->http, &handle_request, state);
 
-  sp_playlistcontainer *pc = sp_session_playlistcontainer(session);
-  sp_playlistcontainer_add_callbacks(pc, &playlistcontainer_callbacks,
-                                     session);
+  // Bind HTTP server
+  int bind = evhttp_bind_socket(state->http, state->http_host,
+                                state->http_port);
+
+  if (bind == -1) {
+    syslog(LOG_WARNING, "Could not bind HTTP server socket to %s:%d",
+           state->http_host, state->http_port);
+    sp_session_logout(session);
+    return;
+  }
+
+  syslog(LOG_DEBUG, "HTTP server listening on %s:%d", state->http_host,
+         state->http_port);
 }
 
 void process_events(evutil_socket_t socket, short what, void *userdata) {

@@ -13,13 +13,13 @@ json_t *track_to_json(sp_track *track, json_t *object) {
   sp_link_as_string(link, uri, kTrackLinkLength);
   sp_link_release(link);
 
-  json_object_set_new(object, "uri", json_string_nocheck(uri)); 
+  json_object_set_new(object, "uri", json_string_nocheck(uri));
 
   if (!sp_track_is_loaded(track))
     return object;
 
   const char *name = sp_track_name(track);
-  json_object_set_new(object, "title", json_string_nocheck(name)); 
+  json_object_set_new(object, "title", json_string_nocheck(name));
   return object;
 }
 
@@ -42,9 +42,9 @@ json_t *playlist_to_json(sp_playlist *playlist, json_t *object) {
                               json_string_nocheck(username));
 
   // URI
-  size_t playlist_uri_len = strlen("spotify:user:") + strlen(username) + 
-                            strlen(":playlist:") +
-                            strlen("284on3DVWeAxWkgVuzZKGt") + 1;
+  size_t playlist_uri_len = sizeof("spotify:user:") + sizeof(username) +
+                            sizeof(":playlist:") +
+                            sizeof("284on3DVWeAxWkgVuzZKGt") + 1;
   char *playlist_uri = malloc(playlist_uri_len);
 
   if (playlist_uri == NULL)
@@ -57,7 +57,7 @@ json_t *playlist_to_json(sp_playlist *playlist, json_t *object) {
 
   sp_link_as_string(playlist_link, playlist_uri, playlist_uri_len);
   sp_link_release(playlist_link);
-  json_object_set_new(object, "uri", 
+  json_object_set_new(object, "uri",
                       json_string_nocheck(playlist_uri));
   free(playlist_uri);
 
@@ -128,8 +128,10 @@ json_t *playlist_to_json(sp_playlist *playlist, json_t *object) {
     json_object_set_new(track_object, "duration", json_integer(sp_track_duration(track)));
     json_object_set_new(track_object, "uri", json_string_nocheck(track_uri));
 
-    json_array_append_new(tracks, track_object);
+// liesen's change
+//    json_array_append_new(tracks, track_object);
 
+    json_array_append_new(tracks, json_string_nocheck(track_uri));
     sp_link_release(track_link);
   }
 
